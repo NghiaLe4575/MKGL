@@ -12,6 +12,13 @@ from .util import VirtualTensor, Range, RepeatGraph
 from .util import bincount, variadic_topks
 from .layer import *
 
+def print_stat(name, tensor):
+    if tensor is None:
+        print(f"DEBUG: {name} is None")
+        return
+    t = tensor.float() # Convert to float for stat calculation to avoid overflow/underflow issues in stats
+    print(f"DEBUG: {name} | Shape: {list(t.shape)} | Min: {t.min().item():.4f} | Max: {t.max().item():.4f} | Mean: {t.mean().item():.4f} | NaNs: {torch.isnan(t).sum().item()}")
+
 @R.register("PNA")
 class PNA(nn.Module, core.Configurable):
 
@@ -71,6 +78,10 @@ class ConditionedPNA(PNA, core.Configurable):
 
 
     def forward(self, h_index, r_index, t_index, hidden_states, rel_hidden_states, graph, score_text_embs, all_index):
+        print(f"DEBUG: START FORWARD | h_max={h_index.max()} t_max={t_index.max()} r_max={r_index.max()}")
+        if r_index.max() >= self.num_relation * 2:
+            print(f"CRASH PENDING: r_index {r_index.max()} >= limit {self.num_relation * 2}")
+        
         if self.training:
             graph = self.remove_easy_edges(graph, h_index, t_index, r_index)
         graph = graph.undirected(add_inverse=True)
@@ -85,8 +96,15 @@ class ConditionedPNA(PNA, core.Configurable):
         assert (h_index[:, [0]] == h_index).all()
         assert (r_index[:, [0]] == r_index).all()
 
+        if r_index[:, 0].max() >= self.rel_embedding.num_embeddings:
+            print(f"CRASH PENDING: Rel Embedding Index {r_index[:, 0].max()} >= {self.rel_embedding.num_embeddings}")
+
         rel_embeds = self.rel_embedding(r_index[:, 0]) 
         rel_embeds = rel_embeds.type(hidden_states.dtype) #+ rel_hidden_states
+        
+        # DEBUG: Check initial embeddings
+        print_stat("Forward: Initial hidden_states", hidden_states)
+        print_stat("Forward: Initial rel_embeds", rel_embeds)
 
         input_embeds, init_score = self.init_input_embeds(graph, hidden_states, h_index[:, 0], score_text_embs, all_index, rel_embeds)
         score = self.aggregate(graph, h_index[:, 0], r_index[:, 0], input_embeds, rel_embeds, init_score)
@@ -94,6 +112,7 @@ class ConditionedPNA(PNA, core.Configurable):
         return score
 
     def aggregate(self, graph, h_index, r_index, input_embeds, rel_embeds, init_score):
+        
         query = rel_embeds
         boundary, score = input_embeds, init_score
         hidden = boundary.clone()
@@ -108,45 +127,114 @@ class ConditionedPNA(PNA, core.Configurable):
         with graph.edge():
             graph.edge_id = Range(graph.num_edge, device=h_index.device)
         pna_degree_mean = (graph[0].degree_out + 1).log().mean()
-
-        for layer in self.layers:
+        
+        print("\n--- START AGGREGATE ---")
+        print_stat("Aggregate: Init Score", graph.score)
+        
+        for i, layer in enumerate(self.layers):
+            print(f"\n--- LAYER {i} START ---")
+            print_stat(f"Layer {i}: graph.score (Start of Loop)", graph.score)
+            
             edge_index = self.select_edges(graph, graph.score)
             subgraph = graph.edge_mask(edge_index, compact=True)
             subgraph.pna_degree_mean = pna_degree_mean
 
-            layer_input = F.sigmoid(subgraph.score).unsqueeze(-1) * subgraph.hidden
+            # --- INSERT THIS DEBUG BLOCK ---
+            sub_edge_attr = getattr(subgraph, 'edge_attr', None)
+            if sub_edge_attr is not None:
+                max_val = sub_edge_attr.max().item()
+                limit = self.num_relation * 2
+                print(f"DEBUG: Layer {i} | Edge Attr Max: {max_val} | Limit: {limit}")
+                
+                if max_val >= limit:
+                    print(f"!!! CRASH DETECTED !!!")
+                    print(f"You have a Relation ID {max_val} but only configured {limit} slots.")
+                    print(f"Your 'sub_edge_attr' logic is correct, but the DATA is out of bounds.")
+                    # We exit explicitly to avoid the confusing CUDA error
+                    import sys; sys.exit(1)
+            # -------------------------------
+
+            # Gating mechanism: check if sigmoid is saturating due to high score
+            gate = F.sigmoid(subgraph.score).unsqueeze(-1)
+            print_stat(f"Layer {i}: Gate (Sigmoid output)", gate)
+            
+            layer_input = gate * subgraph.hidden
             hidden = layer(subgraph, layer_input.type(torch.float32))
             out_mask = subgraph.degree_out > 0
             node_out = subgraph.node_id[out_mask]
 
-            graph.hidden[node_out] = (graph.hidden[node_out] + hidden[out_mask]).type(graph.hidden[node_out].dtype)
+            # Update Hidden
+            prev_hidden = graph.hidden[node_out]
+            update_delta = hidden[out_mask]
+            
+            # Check for explosion in hidden states (often causes score explosion next)
+            if update_delta.abs().max() > 100:
+                print(f"WARNING: Layer {i} hidden update delta is large!")
+                print_stat(f"Layer {i}: Update Delta", update_delta)
+            
+            graph.hidden[node_out] = (prev_hidden + update_delta).type(graph.hidden[node_out].dtype)
+            print_stat(f"Layer {i}: Updated Hidden (Subset)", graph.hidden[node_out])
 
             index = graph.node2graph[node_out]
-            graph.score[node_out] = self.score(graph.hidden[node_out], query[index]).type(graph.score[node_out].dtype)
+            
+            # Update Score
+            print(f"DEBUG: Layer {i} | Calculating new scores...")
+            new_scores = self.score(graph.hidden[node_out], query[index])
+            
+            # Track the new scores BEFORE they go back into the graph
+            print_stat(f"Layer {i}: New Scores Calculated", new_scores)
+            
+            graph.score[node_out] = new_scores.type(graph.score[node_out].dtype)
 
             data_dict, meta_dict = subgraph.data_by_meta("graph")
             graph.meta_dict.update(meta_dict)
             graph.__dict__.update(data_dict)
 
+        print("--- END AGGREGATE ---\n")
         return graph.score
 
     def init_input_embeds(self, graph, head_embeds, head_index, tail_embeds, tail_index,  rel_embeds):
-        input_embeds = VirtualTensor.zeros(graph.num_node, rel_embeds.shape[1], device=rel_embeds.device, dtype=rel_embeds.dtype)
+        if tail_embeds.dtype != head_embeds.dtype:
+            tail_embeds = tail_embeds.to(head_embeds.dtype)
         
+        input_embeds = VirtualTensor.zeros(graph.num_node, rel_embeds.shape[1], device=rel_embeds.device, dtype=rel_embeds.dtype)
         
         input_embeds[tail_index] = tail_embeds.type(head_embeds.dtype)
         input_embeds[head_index] = head_embeds
 
-        score = VirtualTensor.gather(self.score(torch.zeros_like(rel_embeds), rel_embeds), graph.node2graph) # zero all
-        score[head_index] = self.score(head_embeds, rel_embeds)
+        print("\nDEBUG: init_input_embeds calc start")
+        zero_scores = self.score(torch.zeros_like(rel_embeds), rel_embeds)
+        print_stat("init_input_embeds: Raw Score (Zero Embeds)", zero_scores)
+        
+        score = VirtualTensor.gather(zero_scores, graph.node2graph) # zero all
+        
+        score_head = self.score(head_embeds, rel_embeds)
+        print_stat("init_input_embeds: Raw Score (Head Embeds)", score_head)
+        
+        score[head_index] = score_head
+        
+        # Check before clamp
+        print_stat("init_input_embeds: Score All (Pre-Clamp)", score)
+        
+        # Apply clamping to prevent extreme values
+        score = torch.clamp(score, min=-15, max=15)
+        
+        # Check after clamp
+        print_stat("init_input_embeds: Score All (Post-Clamp)", score)
             
         return input_embeds, score
 
     def score(self, hidden, rel_embeds):
         heuristic = self.linear(torch.cat([hidden, rel_embeds], dim=-1))
         x = hidden * heuristic
-        score = self.mlp(x).squeeze(-1)
-        return score
+        raw_score = self.mlp(x).squeeze(-1)
+        if raw_score.abs().max() > 50 or torch.isnan(raw_score).any():
+            print("  DEBUG: score() internal tracking:")
+            print_stat("    score input: hidden", hidden)
+            print_stat("    score input: heuristic", heuristic)
+            print_stat("    score input: x (hidden*heuristic)", x)
+            print_stat("    score output", raw_score)
+        return raw_score
 
 
     def select_edges(self, graph, score):
