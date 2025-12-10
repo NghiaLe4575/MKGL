@@ -16,7 +16,12 @@ def print_stat(name, tensor):
     if tensor is None:
         print(f"DEBUG: {name} is None")
         return
-    t = tensor.float() # Convert to float for stat calculation to avoid overflow/underflow issues in stats
+    # Handle VirtualTensor by converting to regular tensor first
+    if hasattr(tensor, 'storage'):
+        # VirtualTensor - convert to regular tensor
+        t = tensor.storage.float() if hasattr(tensor.storage, 'float') else tensor.storage
+    else:
+        t = tensor.float() if tensor.dtype != torch.float32 else tensor
     print(f"DEBUG: {name} | Shape: {list(t.shape)} | Min: {t.min().item():.4f} | Max: {t.max().item():.4f} | Mean: {t.mean().item():.4f} | NaNs: {torch.isnan(t).sum().item()}")
 
 @R.register("PNA")
