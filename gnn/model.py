@@ -17,11 +17,22 @@ def print_stat(name, tensor):
         print(f"DEBUG: {name} is None")
         return
     # Handle VirtualTensor by converting to regular tensor first
-    if hasattr(tensor, 'storage'):
-        # VirtualTensor - convert to regular tensor
-        t = tensor.storage.float() if hasattr(tensor.storage, 'float') else tensor.storage
+    if hasattr(tensor, '__class__') and 'VirtualTensor' in tensor.__class__.__name__:
+        # VirtualTensor - access the underlying storage
+        if hasattr(tensor, 'storage') and callable(tensor.storage):
+            t = tensor.storage()  # Call it if it's a method
+        elif hasattr(tensor, '_storage'):
+            t = tensor._storage  # Try private attribute
+        else:
+            # Fallback: try to convert to regular tensor
+            t = torch.tensor(tensor)
     else:
-        t = tensor.float() if tensor.dtype != torch.float32 else tensor
+        t = tensor
+    
+    # Ensure it's float for statistics
+    if hasattr(t, 'float'):
+        t = t.float() if t.dtype != torch.float32 else t
+    
     print(f"DEBUG: {name} | Shape: {list(t.shape)} | Min: {t.min().item():.4f} | Max: {t.max().item():.4f} | Mean: {t.mean().item():.4f} | NaNs: {torch.isnan(t).sum().item()}")
 
 @R.register("PNA")

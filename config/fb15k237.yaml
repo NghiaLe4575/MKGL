@@ -40,7 +40,8 @@ trainer:
   eval_steps: 500
   save_strategy: 'no' #epoch
   warmup_steps: 50
-  bf16: yes             
+  bf16: no
+  fp16: yes             
   fp16: no
   logging_steps: 10
   logging_strategy: steps

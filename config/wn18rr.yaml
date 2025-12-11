@@ -39,7 +39,8 @@ trainer:
   evaluation_strategy: epoch #steps
   save_strategy: 'no' #epoch
   warmup_steps: 0
-  bf16: yes
+  bf16: no
+  fp16: yes
   logging_steps: 10
   logging_strategy: steps
   learning_rate: 5.0e-3
