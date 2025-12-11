@@ -16,16 +16,22 @@ def print_stat(name, tensor):
     if tensor is None:
         print(f"DEBUG: {name} is None")
         return
-    # Handle VirtualTensor by converting to regular tensor first
+    
+    # Handle VirtualTensor by materializing it
     if hasattr(tensor, '__class__') and 'VirtualTensor' in tensor.__class__.__name__:
-        # VirtualTensor - access the underlying storage
-        if hasattr(tensor, 'storage') and callable(tensor.storage):
-            t = tensor.storage()  # Call it if it's a method
-        elif hasattr(tensor, '_storage'):
-            t = tensor._storage  # Try private attribute
-        else:
-            # Fallback: try to convert to regular tensor
-            t = torch.tensor(tensor)
+        # VirtualTensor - materialize by accessing all elements
+        try:
+            indices = torch.arange(len(tensor), device=tensor.device)
+            t = tensor[indices]
+        except:
+            # If that fails, try to access the underlying values/input directly
+            if hasattr(tensor, 'values') and len(tensor.values) > 0:
+                t = tensor.values
+            elif hasattr(tensor, 'input'):
+                t = tensor.input
+            else:
+                print(f"DEBUG: {name} | Cannot materialize VirtualTensor")
+                return
     else:
         t = tensor
     
