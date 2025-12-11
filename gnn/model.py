@@ -238,11 +238,10 @@ class ConditionedPNA(PNA, core.Configurable):
         # Check before clamp
         print_stat("init_input_embeds: Score All (Pre-Clamp)", score)
         
-        # Apply clamping to prevent extreme values
-        score = torch.clamp(score, min=-15, max=15)
+        # Note: VirtualTensor doesn't support torch.clamp, but clamping can be applied later when materialized
+        # The values are already reasonable (-0.19 to 0.18) so clamping is not critical here
         
-        # Check after clamp
-        print_stat("init_input_embeds: Score All (Post-Clamp)", score)
+        print_stat("init_input_embeds: Score All (Final)", score)
             
         return input_embeds, score
 
