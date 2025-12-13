@@ -118,6 +118,6 @@ if __name__ == "__main__":
         data_collator=data_loader,
         compute_metrics=compute_metrics
     )
-    trainer.evaluate()
+    #trainer.evaluate()
     trainer.train()
 
