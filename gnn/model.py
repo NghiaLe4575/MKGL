@@ -16,29 +16,11 @@ def print_stat(name, tensor):
     if tensor is None:
         print(f"DEBUG: {name} is None")
         return
-    
-    # Handle VirtualTensor by materializing it
-    if hasattr(tensor, '__class__') and 'VirtualTensor' in tensor.__class__.__name__:
-        # VirtualTensor - materialize by accessing all elements
-        try:
-            indices = torch.arange(len(tensor), device=tensor.device)
-            t = tensor[indices]
-        except:
-            # If that fails, try to access the underlying values/input directly
-            if hasattr(tensor, 'values') and len(tensor.values) > 0:
-                t = tensor.values
-            elif hasattr(tensor, 'input'):
-                t = tensor.input
-            else:
-                print(f"DEBUG: {name} | Cannot materialize VirtualTensor")
-                return
-    else:
-        t = tensor
-    
-    # Ensure it's float for statistics
-    if hasattr(t, 'float'):
-        t = t.float() if t.dtype != torch.float32 else t
-    
+    # Handle VirtualTensor - it's a sparse representation, so just print basic info
+    if isinstance(tensor, VirtualTensor):
+        print(f"DEBUG: {name} | Type: VirtualTensor | Keys: {len(tensor.keys)} | Storage shape: {tensor.storage.shape if hasattr(tensor, 'storage') else 'N/A'}")
+        return
+    t = tensor.float() # Convert to float for stat calculation to avoid overflow/underflow issues in stats
     print(f"DEBUG: {name} | Shape: {list(t.shape)} | Min: {t.min().item():.4f} | Max: {t.max().item():.4f} | Mean: {t.mean().item():.4f} | NaNs: {torch.isnan(t).sum().item()}")
 
 @R.register("PNA")
@@ -101,9 +83,7 @@ class ConditionedPNA(PNA, core.Configurable):
 
     def forward(self, h_index, r_index, t_index, hidden_states, rel_hidden_states, graph, score_text_embs, all_index):
         print(f"DEBUG: START FORWARD | h_max={h_index.max()} t_max={t_index.max()} r_max={r_index.max()}")
-        if r_index.max() >= self.num_relation * 2:
-            print(f"CRASH PENDING: r_index {r_index.max()} >= limit {self.num_relation * 2}")
-        
+        print(f"DEBUG: GRAPH STATS | num_nodes={graph.num_node} edge_max={graph.edge_list[:, :2].max() if hasattr(graph, 'edge_list') else 'N/A'}")
         if self.training:
             graph = self.remove_easy_edges(graph, h_index, t_index, r_index)
         graph = graph.undirected(add_inverse=True)
@@ -123,7 +103,6 @@ class ConditionedPNA(PNA, core.Configurable):
 
         rel_embeds = self.rel_embedding(r_index[:, 0]) 
         rel_embeds = rel_embeds.type(hidden_states.dtype) #+ rel_hidden_states
-        
         # DEBUG: Check initial embeddings
         print_stat("Forward: Initial hidden_states", hidden_states)
         print_stat("Forward: Initial rel_embeds", rel_embeds)
@@ -134,7 +113,6 @@ class ConditionedPNA(PNA, core.Configurable):
         return score
 
     def aggregate(self, graph, h_index, r_index, input_embeds, rel_embeds, init_score):
-        
         query = rel_embeds
         boundary, score = input_embeds, init_score
         hidden = boundary.clone()
@@ -149,32 +127,15 @@ class ConditionedPNA(PNA, core.Configurable):
         with graph.edge():
             graph.edge_id = Range(graph.num_edge, device=h_index.device)
         pna_degree_mean = (graph[0].degree_out + 1).log().mean()
-        
         print("\n--- START AGGREGATE ---")
         print_stat("Aggregate: Init Score", graph.score)
-        
+
         for i, layer in enumerate(self.layers):
             print(f"\n--- LAYER {i} START ---")
             print_stat(f"Layer {i}: graph.score (Start of Loop)", graph.score)
-            
             edge_index = self.select_edges(graph, graph.score)
             subgraph = graph.edge_mask(edge_index, compact=True)
             subgraph.pna_degree_mean = pna_degree_mean
-
-            # --- INSERT THIS DEBUG BLOCK ---
-            sub_edge_attr = getattr(subgraph, 'edge_attr', None)
-            if sub_edge_attr is not None:
-                max_val = sub_edge_attr.max().item()
-                limit = self.num_relation * 2
-                print(f"DEBUG: Layer {i} | Edge Attr Max: {max_val} | Limit: {limit}")
-                
-                if max_val >= limit:
-                    print(f"!!! CRASH DETECTED !!!")
-                    print(f"You have a Relation ID {max_val} but only configured {limit} slots.")
-                    print(f"Your 'sub_edge_attr' logic is correct, but the DATA is out of bounds.")
-                    # We exit explicitly to avoid the confusing CUDA error
-                    import sys; sys.exit(1)
-            # -------------------------------
 
             # Gating mechanism: check if sigmoid is saturating due to high score
             gate = F.sigmoid(subgraph.score).unsqueeze(-1)
@@ -193,7 +154,7 @@ class ConditionedPNA(PNA, core.Configurable):
             if update_delta.abs().max() > 100:
                 print(f"WARNING: Layer {i} hidden update delta is large!")
                 print_stat(f"Layer {i}: Update Delta", update_delta)
-            
+                
             graph.hidden[node_out] = (prev_hidden + update_delta).type(graph.hidden[node_out].dtype)
             print_stat(f"Layer {i}: Updated Hidden (Subset)", graph.hidden[node_out])
 
@@ -216,31 +177,23 @@ class ConditionedPNA(PNA, core.Configurable):
         return graph.score
 
     def init_input_embeds(self, graph, head_embeds, head_index, tail_embeds, tail_index,  rel_embeds):
-        if tail_embeds.dtype != head_embeds.dtype:
-            tail_embeds = tail_embeds.to(head_embeds.dtype)
-        
         input_embeds = VirtualTensor.zeros(graph.num_node, rel_embeds.shape[1], device=rel_embeds.device, dtype=rel_embeds.dtype)
+        
         
         input_embeds[tail_index] = tail_embeds.type(head_embeds.dtype)
         input_embeds[head_index] = head_embeds
 
         print("\nDEBUG: init_input_embeds calc start")
-        zero_scores = self.score(torch.zeros_like(rel_embeds), rel_embeds)
-        print_stat("init_input_embeds: Raw Score (Zero Embeds)", zero_scores)
-        
-        score = VirtualTensor.gather(zero_scores, graph.node2graph) # zero all
+        score = VirtualTensor.gather(self.score(torch.zeros_like(rel_embeds), rel_embeds), graph.node2graph) # zero all
+        print_stat("init_input_embeds: Raw Score (Zero Embeds)", score)
         
         score_head = self.score(head_embeds, rel_embeds)
         print_stat("init_input_embeds: Raw Score (Head Embeds)", score_head)
         
         score[head_index] = score_head
         
-        # Check before clamp
-        print_stat("init_input_embeds: Score All (Pre-Clamp)", score)
-        
-        # Note: VirtualTensor doesn't support torch.clamp, but clamping can be applied later when materialized
-        # The values are already reasonable (-0.19 to 0.18) so clamping is not critical here
-        
+        # Note: Skipping clamp for VirtualTensor (not supported by torch.clamp)
+        # The PyG model uses regular tensors and applies clamping there
         print_stat("init_input_embeds: Score All (Final)", score)
             
         return input_embeds, score
