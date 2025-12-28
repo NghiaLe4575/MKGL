@@ -163,8 +163,15 @@ class KGL4KGC(nn.Module):
         metric = {}
         target = torch.zeros_like(pred)
         target[:, 0] = 1
+        
+        #print("\n--- LOSS FUNCTION DEBUG ---")
+        #print(f"DEBUG Loss: pred shape={list(pred.shape)} | Min={pred.min().item():.4f} | Max={pred.max().item():.4f} | Mean={pred.mean().item():.4f} | NaNs={torch.isnan(pred).sum().item()}")
+        #print(f"DEBUG Loss: target shape={list(target.shape)} | Pos count={target.sum().item()}")
+        
         loss = F.binary_cross_entropy_with_logits(
             pred, target, reduction="none")
+        
+        #print(f"DEBUG Loss: BCE loss (per-sample) | Min={loss.min().item():.4f} | Max={loss.max().item():.4f} | Mean={loss.mean().item():.4f} | NaNs={torch.isnan(loss).sum().item()}")
 
         neg_weight = torch.ones_like(pred)
         if self.adversarial_temperature > 0:
@@ -174,13 +181,20 @@ class KGL4KGC(nn.Module):
         else:
             neg_weight[:, 1:] = 1 / self.num_negative
         loss = (loss * neg_weight).sum(dim=-1) / neg_weight.sum(dim=-1)
+        
+        #print(f"DEBUG Loss: Weighted loss (per-batch) | Min={loss.min().item():.4f} | Max={loss.max().item():.4f} | Mean={loss.mean().item():.4f}")
+        
         loss = loss.mean()
 
+        #print(f"DEBUG Loss: Final mean loss = {loss.item():.6f}")
         
         if all_loss is not None:
+         #   print(f"DEBUG Loss: all_loss = {all_loss.item():.6f}")
             loss = loss + all_loss
+           # print(f"DEBUG Loss: Total loss (with all_loss) = {loss.item():.6f}")
             
         metric['loss'] = loss
+        #print("--- END LOSS FUNCTION DEBUG ---\n")
         
         return loss, metric
     

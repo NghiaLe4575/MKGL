@@ -82,8 +82,8 @@ class ConditionedPNA(PNA, core.Configurable):
 
 
     def forward(self, h_index, r_index, t_index, hidden_states, rel_hidden_states, graph, score_text_embs, all_index):
-        print(f"DEBUG: START FORWARD | h_max={h_index.max()} t_max={t_index.max()} r_max={r_index.max()}")
-        print(f"DEBUG: GRAPH STATS | num_nodes={graph.num_node} edge_max={graph.edge_list[:, :2].max() if hasattr(graph, 'edge_list') else 'N/A'}")
+        #print(f"DEBUG: START FORWARD | h_max={h_index.max()} t_max={t_index.max()} r_max={r_index.max()}")
+        #print(f"DEBUG: GRAPH STATS | num_nodes={graph.num_node} edge_max={graph.edge_list[:, :2].max() if hasattr(graph, 'edge_list') else 'N/A'}")
         if self.training:
             graph = self.remove_easy_edges(graph, h_index, t_index, r_index)
         graph = graph.undirected(add_inverse=True)
@@ -104,8 +104,8 @@ class ConditionedPNA(PNA, core.Configurable):
         rel_embeds = self.rel_embedding(r_index[:, 0]) 
         rel_embeds = rel_embeds.type(hidden_states.dtype) #+ rel_hidden_states
         # DEBUG: Check initial embeddings
-        print_stat("Forward: Initial hidden_states", hidden_states)
-        print_stat("Forward: Initial rel_embeds", rel_embeds)
+        #print_stat("Forward: Initial hidden_states", hidden_states)
+        #print_stat("Forward: Initial rel_embeds", rel_embeds)
 
         input_embeds, init_score = self.init_input_embeds(graph, hidden_states, h_index[:, 0], score_text_embs, all_index, rel_embeds)
         score = self.aggregate(graph, h_index[:, 0], r_index[:, 0], input_embeds, rel_embeds, init_score)
@@ -127,19 +127,19 @@ class ConditionedPNA(PNA, core.Configurable):
         with graph.edge():
             graph.edge_id = Range(graph.num_edge, device=h_index.device)
         pna_degree_mean = (graph[0].degree_out + 1).log().mean()
-        print("\n--- START AGGREGATE ---")
-        print_stat("Aggregate: Init Score", graph.score)
+        #print("\n--- START AGGREGATE ---")
+        #print_stat("Aggregate: Init Score", graph.score)
 
         for i, layer in enumerate(self.layers):
-            print(f"\n--- LAYER {i} START ---")
-            print_stat(f"Layer {i}: graph.score (Start of Loop)", graph.score)
+            #print(f"\n--- LAYER {i} START ---")
+            #print_stat(f"Layer {i}: graph.score (Start of Loop)", graph.score)
             edge_index = self.select_edges(graph, graph.score)
             subgraph = graph.edge_mask(edge_index, compact=True)
             subgraph.pna_degree_mean = pna_degree_mean
 
             # Gating mechanism: check if sigmoid is saturating due to high score
             gate = F.sigmoid(subgraph.score).unsqueeze(-1)
-            print_stat(f"Layer {i}: Gate (Sigmoid output)", gate)
+            #print_stat(f"Layer {i}: Gate (Sigmoid output)", gate)
             
             layer_input = gate * subgraph.hidden
             hidden = layer(subgraph, layer_input.type(torch.float32))
@@ -151,21 +151,21 @@ class ConditionedPNA(PNA, core.Configurable):
             update_delta = hidden[out_mask]
             
             # Check for explosion in hidden states (often causes score explosion next)
-            if update_delta.abs().max() > 100:
-                print(f"WARNING: Layer {i} hidden update delta is large!")
-                print_stat(f"Layer {i}: Update Delta", update_delta)
+            #if update_delta.abs().max() > 100:
+            #    print(f"WARNING: Layer {i} hidden update delta is large!")
+            #    print_stat(f"Layer {i}: Update Delta", update_delta)
                 
             graph.hidden[node_out] = (prev_hidden + update_delta).type(graph.hidden[node_out].dtype)
-            print_stat(f"Layer {i}: Updated Hidden (Subset)", graph.hidden[node_out])
+            #print_stat(f"Layer {i}: Updated Hidden (Subset)", graph.hidden[node_out])
 
             index = graph.node2graph[node_out]
             
             # Update Score
-            print(f"DEBUG: Layer {i} | Calculating new scores...")
+            #print(f"DEBUG: Layer {i} | Calculating new scores...")
             new_scores = self.score(graph.hidden[node_out], query[index])
             
             # Track the new scores BEFORE they go back into the graph
-            print_stat(f"Layer {i}: New Scores Calculated", new_scores)
+            #print_stat(f"Layer {i}: New Scores Calculated", new_scores)
             
             graph.score[node_out] = new_scores.type(graph.score[node_out].dtype)
 
@@ -173,7 +173,7 @@ class ConditionedPNA(PNA, core.Configurable):
             graph.meta_dict.update(meta_dict)
             graph.__dict__.update(data_dict)
 
-        print("--- END AGGREGATE ---\n")
+        #print("--- END AGGREGATE ---\n")
         return graph.score
 
     def init_input_embeds(self, graph, head_embeds, head_index, tail_embeds, tail_index,  rel_embeds):
@@ -183,18 +183,18 @@ class ConditionedPNA(PNA, core.Configurable):
         input_embeds[tail_index] = tail_embeds.type(head_embeds.dtype)
         input_embeds[head_index] = head_embeds
 
-        print("\nDEBUG: init_input_embeds calc start")
+        #print("\nDEBUG: init_input_embeds calc start")
         score = VirtualTensor.gather(self.score(torch.zeros_like(rel_embeds), rel_embeds), graph.node2graph) # zero all
-        print_stat("init_input_embeds: Raw Score (Zero Embeds)", score)
+        #print_stat("init_input_embeds: Raw Score (Zero Embeds)", score)
         
         score_head = self.score(head_embeds, rel_embeds)
-        print_stat("init_input_embeds: Raw Score (Head Embeds)", score_head)
+        #print_stat("init_input_embeds: Raw Score (Head Embeds)", score_head)
         
         score[head_index] = score_head
         
         # Note: Skipping clamp for VirtualTensor (not supported by torch.clamp)
         # The PyG model uses regular tensors and applies clamping there
-        print_stat("init_input_embeds: Score All (Final)", score)
+        #print_stat("init_input_embeds: Score All (Final)", score)
             
         return input_embeds, score
 
@@ -202,12 +202,12 @@ class ConditionedPNA(PNA, core.Configurable):
         heuristic = self.linear(torch.cat([hidden, rel_embeds], dim=-1))
         x = hidden * heuristic
         raw_score = self.mlp(x).squeeze(-1)
-        if raw_score.abs().max() > 50 or torch.isnan(raw_score).any():
-            print("  DEBUG: score() internal tracking:")
-            print_stat("    score input: hidden", hidden)
-            print_stat("    score input: heuristic", heuristic)
-            print_stat("    score input: x (hidden*heuristic)", x)
-            print_stat("    score output", raw_score)
+        #if raw_score.abs().max() > 50 or torch.isnan(raw_score).any():
+         #   print("  DEBUG: score() internal tracking:")
+          #  print_stat("    score input: hidden", hidden)
+           # print_stat("    score input: heuristic", heuristic)
+           # print_stat("    score input: x (hidden*heuristic)", x)
+           # print_stat("    score output", raw_score)
         return raw_score
 
 
